@@ -7,6 +7,7 @@ import psutil
 import json
 import threading
 import shutil
+import time
 from urllib.parse import quote_plus
 
 from flask import Flask, request
@@ -17,9 +18,18 @@ from telegram.ext import (
 )
 
 # =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+logger = logging.getLogger("python-host-bot")
+
+# =========================
 # CONFIG
 # =========================
-TOKEN = os.environ.get("TOKEN")
+TOKEN = os.environ.get("TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8080")
 
@@ -31,53 +41,62 @@ OWNERSHIP_FILE = "ownership.json"
 
 running_processes = {}  # {target_id: {"process": Popen, "log": log_path}}
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
 # =========================
-# FLASK SERVER
+# FLASK SERVER (Render requires PORT open)
 # =========================
 app = Flask(__name__)
+STARTUP_ERRORS = []  # store startup problems to show on homepage
 
-@app.route('/')
+@app.route("/")
 def home():
+    if STARTUP_ERRORS:
+        return (
+            "⚠️ Bot Web Service is running, but Telegram bot failed to start.\n\n"
+            + "\n".join(STARTUP_ERRORS),
+            200
+        )
     return "🤖 Python Host Bot is Alive!", 200
 
-@app.route('/status')
+@app.route("/status")
 def script_status():
-    script_name = request.args.get('script')
+    script_name = request.args.get("script")
     if not script_name:
         return "Specify script", 400
 
-    if script_name in running_processes and running_processes[script_name]['process'].poll() is None:
+    if script_name in running_processes and running_processes[script_name]["process"].poll() is None:
         return f"✅ {script_name} is running.", 200
     return f"❌ {script_name} is stopped.", 404
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+def run_flask_forever():
+    port = int(os.environ.get("PORT", "8080"))
+    logger.info("Starting Flask on 0.0.0.0:%s", port)
+    # Flask dev server is OK for Render simple health endpoints
+    app.run(host="0.0.0.0", port=port)
 
 # =========================
-# DATA MANAGEMENT
+# JSON helpers
 # =========================
-def get_allowed_users():
-    if not os.path.exists(USERS_FILE):
-        return []
+def _safe_load_json(path, default):
+    if not os.path.exists(path):
+        return default
     try:
-        with open(USERS_FILE, 'r') as f:
+        with open(path, "r") as f:
             return json.load(f)
     except:
-        return []
+        return default
+
+def _safe_save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+def get_allowed_users():
+    return _safe_load_json(USERS_FILE, [])
 
 def save_allowed_user(uid: int):
     users = get_allowed_users()
     if uid not in users:
         users.append(uid)
-        with open(USERS_FILE, 'w') as f:
-            json.dump(users, f)
+        _safe_save_json(USERS_FILE, users)
         return True
     return False
 
@@ -85,39 +104,30 @@ def remove_allowed_user(uid: int):
     users = get_allowed_users()
     if uid in users:
         users.remove(uid)
-        with open(USERS_FILE, 'w') as f:
-            json.dump(users, f)
+        _safe_save_json(USERS_FILE, users)
         return True
     return False
 
 def load_ownership():
-    if not os.path.exists(OWNERSHIP_FILE):
-        return {}
-    try:
-        with open(OWNERSHIP_FILE, 'r') as f:
-            return json.load(f)
-    except:
-        return {}
+    return _safe_load_json(OWNERSHIP_FILE, {})
 
 def save_ownership(target_id: str, user_id: int, type_: str):
     data = load_ownership()
     data[target_id] = {"owner": user_id, "type": type_}
-    with open(OWNERSHIP_FILE, 'w') as f:
-        json.dump(data, f)
+    _safe_save_json(OWNERSHIP_FILE, data)
 
 def delete_ownership(target_id: str):
     data = load_ownership()
     if target_id in data:
         del data[target_id]
-        with open(OWNERSHIP_FILE, 'w') as f:
-            json.dump(data, f)
+        _safe_save_json(OWNERSHIP_FILE, data)
 
 def get_owner(target_id: str):
     data = load_ownership()
     return data.get(target_id, {}).get("owner")
 
 # =========================
-# DECORATORS
+# ACCESS CONTROL
 # =========================
 def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
@@ -160,7 +170,7 @@ def extras_keyboard():
 # =========================
 def smart_fix_requirements(req_path):
     try:
-        with open(req_path, 'r') as f:
+        with open(req_path, "r") as f:
             lines = f.readlines()
         clean = []
         for line in lines:
@@ -171,8 +181,8 @@ def smart_fix_requirements(req_path):
                 clean.extend(line[11:].strip().split())
             else:
                 clean.append(line)
-        with open(req_path, 'w') as f:
-            f.write('\n'.join(clean))
+        with open(req_path, "w") as f:
+            f.write("\n".join(clean))
         return True
     except:
         return False
@@ -184,7 +194,7 @@ async def install_requirements(req_path, update):
         proc = await asyncio.create_subprocess_exec(
             "pip", "install", "-r", req_path,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await proc.communicate()
         if proc.returncode == 0:
@@ -195,7 +205,7 @@ async def install_requirements(req_path, update):
         await msg.edit_text(f"❌ Error: {e}")
 
 # =========================
-# BASIC COMMANDS
+# COMMANDS
 # =========================
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,19 +213,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
-        await update.message.reply_text("🚫 Operation Cancelled.", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("🚫 Cancelled.", reply_markup=main_menu_keyboard())
     else:
-        await update.callback_query.message.reply_text("🚫 Operation Cancelled.", reply_markup=main_menu_keyboard())
+        await update.callback_query.message.reply_text("🚫 Cancelled.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
 
 # =========================
-# CONVERSATION 1: UPLOAD FILE
+# UPLOAD FLOW
 # =========================
 WAIT_PY, WAIT_EXTRAS = range(2)
 
 @restricted
 async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📤 Send a `.py` file.", reply_markup=ReplyKeyboardMarkup([['🔙 Cancel']], resize_keyboard=True))
+    await update.message.reply_text("📤 Send a `.py` file.", reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True))
     return WAIT_PY
 
 async def receive_py(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -236,10 +246,10 @@ async def receive_py(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await file.download_to_drive(path)
     save_ownership(fname, uid, "file")
 
-    context.user_data['type'] = 'file'
-    context.user_data['target_id'] = fname
-    context.user_data['work_dir'] = UPLOAD_DIR
-    context.user_data['wait'] = None
+    context.user_data["type"] = "file"
+    context.user_data["target_id"] = fname
+    context.user_data["work_dir"] = UPLOAD_DIR
+    context.user_data["wait"] = None
 
     await update.message.reply_text("✅ Saved. Add extras (optional)?", reply_markup=extras_keyboard())
     return WAIT_EXTRAS
@@ -252,59 +262,56 @@ async def receive_extras(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "reqs" in txt:
         await update.message.reply_text("📂 Send `requirements.txt` now.")
-        context.user_data['wait'] = 'req'
+        context.user_data["wait"] = "req"
     elif ".env" in txt:
         await update.message.reply_text("🔒 Send `.env` now.")
-        context.user_data['wait'] = 'env'
+        context.user_data["wait"] = "env"
 
     return WAIT_EXTRAS
 
 async def receive_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    wait = context.user_data.get('wait')
+    wait = context.user_data.get("wait")
     if not wait:
         return WAIT_EXTRAS
 
     file = await update.message.document.get_file()
     fname = update.message.document.file_name
 
-    target_id = context.user_data['target_id']
-    work_dir = context.user_data['work_dir']
-    type_ = context.user_data['type']
+    target_id = context.user_data["target_id"]
+    work_dir = context.user_data["work_dir"]
+    type_ = context.user_data["type"]
 
-    prefix = target_id if type_ == 'file' else target_id.split("|")[0]
+    prefix = target_id if type_ == "file" else target_id.split("|")[0]
 
-    if wait == 'req' and fname.endswith('.txt'):
+    if wait == "req" and fname.endswith(".txt"):
         path = os.path.join(work_dir, f"{prefix}_req.txt")
         await file.download_to_drive(path)
         await install_requirements(path, update)
 
-    elif wait == 'env' and fname.endswith('.env'):
-        if type_ == 'file':
-            # scripts/<script.py>.env
+    elif wait == "env" and fname.endswith(".env"):
+        if type_ == "file":
             path = os.path.join(work_dir, f"{target_id}.env")
         else:
-            # scripts/<repo>/.env
             path = os.path.join(work_dir, ".env")
         await file.download_to_drive(path)
         await update.message.reply_text("✅ Env saved.")
 
-    context.user_data['wait'] = None
+    context.user_data["wait"] = None
     await update.message.reply_text("Next?", reply_markup=extras_keyboard())
     return WAIT_EXTRAS
 
 # =========================
-# CONVERSATION 2: GIT CLONE
+# GIT FLOW + optional .env
 # =========================
 WAIT_URL, WAIT_SELECT_FILE, WAIT_GIT_EXTRAS = range(2, 5)
 
 @restricted
 async def git_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🌐 Send PUBLIC Git repo URL", reply_markup=ReplyKeyboardMarkup([['🔙 Cancel']], resize_keyboard=True))
+    await update.message.reply_text("🌐 Send PUBLIC Git repo URL", reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True))
     return WAIT_URL
 
 async def receive_git_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-
     if not url.startswith("http"):
         await update.message.reply_text("❌ Invalid URL.")
         return WAIT_URL
@@ -313,7 +320,6 @@ async def receive_git_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     repo_path = os.path.join(UPLOAD_DIR, repo_name)
 
     msg = await update.message.reply_text(f"⏳ Cloning `{repo_name}` ...")
-
     if os.path.exists(repo_path):
         shutil.rmtree(repo_path)
 
@@ -323,27 +329,24 @@ async def receive_git_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         py_files = []
         for root, dirs, files in os.walk(repo_path):
-            for file in files:
-                if file.endswith(".py"):
-                    rel_path = os.path.relpath(os.path.join(root, file), repo_path)
+            for f in files:
+                if f.endswith(".py"):
+                    rel_path = os.path.relpath(os.path.join(root, f), repo_path)
                     py_files.append(rel_path)
 
         if not py_files:
             await update.message.reply_text("❌ No .py found.", reply_markup=main_menu_keyboard())
             return ConversationHandler.END
 
-        context.user_data['repo_path'] = repo_path
-        context.user_data['repo_name'] = repo_name
+        context.user_data["repo_path"] = repo_path
+        context.user_data["repo_name"] = repo_name
 
         req_path = os.path.join(repo_path, "requirements.txt")
         if os.path.exists(req_path):
             await update.message.reply_text("📦 Installing repo requirements.txt ...")
             await install_requirements(req_path, update)
 
-        keyboard = []
-        for f in py_files[:12]:
-            keyboard.append([InlineKeyboardButton(f, callback_data=f"sel_py_{f}")])
-
+        keyboard = [[InlineKeyboardButton(f, callback_data=f"sel_py_{f}")] for f in py_files[:12]]
         await update.message.reply_text("👇 Select main file:", reply_markup=InlineKeyboardMarkup(keyboard))
         return WAIT_SELECT_FILE
 
@@ -356,17 +359,17 @@ async def select_git_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     filename = query.data.split("sel_py_")[1]
-    repo_path = context.user_data['repo_path']
-    repo_name = context.user_data['repo_name']
+    repo_path = context.user_data["repo_path"]
+    repo_name = context.user_data["repo_name"]
     uid = update.effective_user.id
 
     unique_id = f"{repo_name}|{filename}"
     save_ownership(unique_id, uid, "repo")
 
-    context.user_data['type'] = 'repo'
-    context.user_data['target_id'] = unique_id
-    context.user_data['work_dir'] = repo_path
-    context.user_data['wait'] = None
+    context.user_data["type"] = "repo"
+    context.user_data["target_id"] = unique_id
+    context.user_data["work_dir"] = repo_path
+    context.user_data["wait"] = None
 
     await query.edit_message_text(f"✅ Selected `{filename}`")
     await query.message.reply_text("Add extras (optional) then RUN:", reply_markup=extras_keyboard())
@@ -379,7 +382,7 @@ async def git_extra_files_router(update: Update, context: ContextTypes.DEFAULT_T
     return await receive_extra_files(update, context)
 
 # =========================
-# CONVERSATION 3: DEPLOY LINK
+# DEPLOY LINK BUTTON
 # =========================
 WAIT_DEPLOY_REPO = 10
 
@@ -387,7 +390,7 @@ WAIT_DEPLOY_REPO = 10
 async def deploy_render_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚀 Deploy to Render\n\nSend your PUBLIC GitHub repo URL.\nExample:\nhttps://github.com/user/repo",
-        reply_markup=ReplyKeyboardMarkup([['🔙 Cancel']], resize_keyboard=True)
+        reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True),
     )
     return WAIT_DEPLOY_REPO
 
@@ -404,40 +407,37 @@ async def deploy_render_receive(update: Update, context: ContextTypes.DEFAULT_TY
         "✅ Render Deploy Link:\n"
         f"`{deploy_url}`\n\n"
         "Open it in browser and deploy.\n"
-        "Tip: add render.yaml in repo for 1-click blueprint deploy.",
+        "Tip: add render.yaml in repo for 1-click deploy.",
         reply_markup=main_menu_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
     return ConversationHandler.END
 
 # =========================
-# EXECUTION ENGINE
+# RUN SCRIPT
 # =========================
 async def execute_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_func = update.message.reply_text if update.message else update.callback_query.message.reply_text
 
-    target_id = context.user_data.get('target_id', context.user_data.get('fallback_id'))
+    target_id = context.user_data.get("target_id", context.user_data.get("fallback_id"))
     if not target_id:
         await msg_func("❌ Missing target ID", reply_markup=main_menu_keyboard())
         return ConversationHandler.END
 
-    # Decide work_dir, script_path, env_path
     if "|" in target_id:
         repo, file_rel = target_id.split("|", 1)
         work_dir = os.path.join(UPLOAD_DIR, repo)
         script_path = file_rel
-        env_path = os.path.join(work_dir, ".env")  # repo env stored here
+        env_path = os.path.join(work_dir, ".env")
     else:
         work_dir = UPLOAD_DIR
         script_path = target_id
-        env_path = os.path.join(work_dir, f"{target_id}.env")  # file env stored here
+        env_path = os.path.join(work_dir, f"{target_id}.env")
 
-    # Already running?
-    if target_id in running_processes and running_processes[target_id]['process'].poll() is None:
+    if target_id in running_processes and running_processes[target_id]["process"].poll() is None:
         await msg_func(f"⚠️ `{target_id}` is already running!", reply_markup=main_menu_keyboard(), parse_mode="Markdown")
         return ConversationHandler.END
 
-    # Load env overrides
     custom_env = os.environ.copy()
     if os.path.exists(env_path):
         with open(env_path, "r") as f:
@@ -480,7 +480,7 @@ async def execute_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # =========================
-# LIST + MANAGE
+# LIST / MANAGE
 # =========================
 @restricted
 async def list_hosted(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -491,12 +491,9 @@ async def list_hosted(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for tid, meta in ownership.items():
         owner = meta.get("owner")
         if uid == ADMIN_ID or uid == owner:
-            is_running = tid in running_processes and running_processes[tid]['process'].poll() is None
+            is_running = tid in running_processes and running_processes[tid]["process"].poll() is None
             status = "🟢" if is_running else "🔴"
-            label = f"{status} {tid}"
-            if uid == ADMIN_ID and uid != owner:
-                label += f" (User: {owner})"
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"man_{tid}")])
+            keyboard.append([InlineKeyboardButton(f"{status} {tid}", callback_data=f"man_{tid}")])
 
     if not keyboard:
         await update.message.reply_text("📂 No hosted apps.", reply_markup=main_menu_keyboard())
@@ -519,8 +516,9 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if uid != ADMIN_ID and uid != owner:
             return await query.message.reply_text("⛔ Not yours.")
 
-        is_running = target_id in running_processes and running_processes[target_id]['process'].poll() is None
+        is_running = target_id in running_processes and running_processes[target_id]["process"].poll() is None
         text = f"⚙️ Manage: `{target_id}`\nStatus: {'🟢 Running' if is_running else '🔴 Stopped'}"
+
         btns = []
         if is_running:
             btns.append([InlineKeyboardButton("🛑 Stop", callback_data=f"stop_{target_id}")])
@@ -536,19 +534,19 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("stop_"):
         tid = data.split("stop_")[1]
-        if tid in running_processes and running_processes[tid]['process'].poll() is None:
+        if tid in running_processes and running_processes[tid]["process"].poll() is None:
             try:
-                os.killpg(os.getpgid(running_processes[tid]['process'].pid), signal.SIGTERM)
+                os.killpg(os.getpgid(running_processes[tid]["process"].pid), signal.SIGTERM)
             except:
                 pass
-            running_processes[tid]['process'].wait()
+            running_processes[tid]["process"].wait()
             await query.edit_message_text(f"🛑 Stopped `{tid}`", parse_mode="Markdown")
         else:
             await query.message.reply_text("⚠️ Already stopped.")
         return
 
     if data.startswith("rerun_"):
-        context.user_data['fallback_id'] = data.split("rerun_")[1]
+        context.user_data["fallback_id"] = data.split("rerun_")[1]
         await query.delete_message()
         return await execute_logic(update, context)
 
@@ -561,4 +559,4 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = data.split("log_")[1]
         path = os.path.join(UPLOAD_DIR, f"{tid.replace('|','_')}.log")
         if os.path.exists(path):
-            await cont
+            await context.bot.send
